@@ -6,6 +6,8 @@ on it.
 Usage: call explainer.py with either a single index to print a sample
 explanation or with any of --save_explanation, --evaluate or --m_png.
 
+example call: python explainer.py --all --evaluate --output-dir output/new
+
 see --help for details.
 
 Authors: Stefan Alsdorf, Github Copilot
