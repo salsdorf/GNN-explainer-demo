@@ -1,0 +1,5 @@
+matplotlib==3.11.1
+Pillow==12.3.0
+rdkit==2026.3.6
+torch==2.7.1
+torch_geometric==2.8.0.post1

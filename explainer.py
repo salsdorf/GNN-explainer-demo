@@ -1,269 +1,170 @@
+"""Root file of the explainer, for calling and defining output."""
+
+import argparse
 from pathlib import Path
 
-import torch
-
-from torch_geometric.datasets import TUDataset
-from torch_geometric.explain import Explainer, GNNExplainer
-
-from train_demo_gnn import GIN
-
-# atom types from MUTAG readme
-ATOM_NAMES = {
-    0: "C",
-    1: "N",
-    2: "O",
-    3: "F",
-    4: "I",
-    5: "Cl",
-    6: "Br",
-}
-
-# target: standard 0-1 classification for mutagenicism
-CLASS_MEANINGS = {
-    0: "non-mutagenic",
-    1: "mutagenic",
-}
-
-
-def atom_symbol_from_index(index):
-    return ATOM_NAMES.get(int(index), f"X{int(index)}")
-
-
-# use gpu if available
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+from explanation_runner import (
+    CLASS_MEANINGS,
+    run_explanations,
 )
-
-dataset = TUDataset(
-    root="data/MUTAG",
-    name="MUTAG",
-)
-
-# load checkpoint trained by train_demo_gnn
-checkpoint = torch.load(
-    "gin_mutag.pt",
-    map_location=DEVICE,
-)
-
-config = checkpoint["model_config"]
-
-#reinstantiate model 
-model = GIN(
-    num_features=config["num_features"],
-    hidden_channels=config["hidden_channels"],
-    num_classes=config["num_classes"],
-    num_layers=config["num_layers"],
-).to(DEVICE)
-
-# set weights from checkpoint
-model.load_state_dict(
-    checkpoint["model_state_dict"]
-)
-
-# set to evaluation mode
-model.eval()
+from explanation_export import save_explanation_data
+from explanation_evaluation import evaluate_fidelity, evaluate_fidelity_topk, save_fidelity_data
+from visualize_explanation import save_visualization
 
 
-# Select one graph to test on (the first one)
-# todo: select others?
-
-index = 0
-data = dataset[index].to(DEVICE)
-
-#batch: tell the model which nodes belong to which graph, here only one graph so all zeros
-batch = torch.zeros(
-    data.num_nodes,
-    dtype=torch.long,
-    device=DEVICE,
-)
-
-#predict on selected graph 
-
-# no grad because irrelevant outside of training and faster
-with torch.no_grad():
-
-    prediction = model(
-        data.x,
-        data.edge_index,
-        batch,
+def parse_args():
+    parser = argparse.ArgumentParser(description="Explain a MUTAG graph with GNNExplainer.")
+    parser.add_argument(
+        "--mode",
+        choices=("model", "phenomenon"),
+        default="model",
+        help="Specifies whether to explain the model as a whole or a specific classification.",
+    )
+    parser.add_argument(
+        "--algorithm",
+        choices=("GNNExplainer", "PGExplainer", "Dummy"),
+        default="GNNExplainer",
+        help="Explainer algorithm to use.",
+    )
+    parser.add_argument(
+        "--index",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Dataset indices of the graph to explain.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run explanation for every graph in the provided dataset.",
+    )
+    parser.add_argument(
+        "--m_png",
+        action="store_true",
+        help="Output a visualisation of the explanation of the investigated molecule graphs as a png file.",
+    )
+    parser.add_argument(
+        "--top-nodes",
+        type=int,
+        default=0,
+        help="Number of most important nodes to save; 0 saves all nodes.",
+    )
+    parser.add_argument(
+        "--top-edges",
+        type=int,
+        default=0,
+        help="Number of most important edges to save; 0 saves all edges.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="output/explanations",
+        help="Directory for exported explanation JSON files.",
+    )
+    parser.add_argument(
+        "--save_explanation",
+        action="store_true",
+        help="Whether to save the generated explanation data as json. Set --top_nodes/edges to define how much data to save.",
+    )
+    parser.add_argument(
+        "--evaluate",
+        nargs="?",
+        const="basic",
+        choices=("basic", "topk"),
+        help="Define whether and how to evaluate the explanation - Either on the full model or testing different top-k sparsity percentages.",
+    )
+    parser.add_argument(
+        "--topk_step",
+        type=int,
+        default=20,
+        help="Step size for evaluating different top-k-percentages of edge explanations.",
     )
 
-# todo: what are logits
-print("Prediction logits:", prediction)
-print("True label:", data.y.item(), "->", CLASS_MEANINGS.get(int(data.y.item()), "unknown"))
-
-predicted_class = prediction.argmax(dim=-1).item()
-print(
-    "Predicted class:",
-    predicted_class,
-    "->",
-    CLASS_MEANINGS.get(predicted_class, "unknown"),
-)
-
-print()
-print("Selected graph atom types:")
-node_atom_indices = data.x.argmax(dim=-1).tolist()
-for node_index, atom_index in enumerate(node_atom_indices):
-    print(f"  Node {node_index}: {atom_symbol_from_index(atom_index)}")
+    return parser.parse_args()
 
 
-# Build explainer
+def print_result(result):
+    data = result["data"]
+    prediction = result["prediction"]
+    predicted_class = result["predicted_class"]
+    explanation = result["explanation"]
 
-explainer = Explainer(
-    #todo: try phenomenon too
+    print("Explanation type:", result["explanation_type"])
+    print("Prediction logits:", prediction)
+    print("True label:", data.y.item(), "->", CLASS_MEANINGS.get(int(data.y.item()), "unknown"))
+    print("Predicted class:", predicted_class, "->", CLASS_MEANINGS.get(predicted_class, "unknown"))
 
-    model=model,
+    print("\nExplanation:")
+    #print(explanation)
+    print("\nNode mask shape:", explanation.node_mask.shape)
+    print("Edge mask shape:", explanation.edge_mask.shape)
+    print("Edge mask:")
+    print(explanation.edge_mask)
 
-    # metadata for learning masks
-    algorithm=GNNExplainer(
-        epochs=200,
-        lr=0.01,
-    ),
 
-    explanation_type="model",
-    node_mask_type="attributes",    # learn mask based on node attributes i.e. features
-    edge_mask_type="object",
-    model_config=dict(
-        mode="multiclass_classification",
-        task_level="graph",     # prediction level
-        return_type="raw",      # return logits raw, todo try different options
-    ),
-)
+def main():
+    args = parse_args()
+    if args.index is not None and args.all:
+        raise ValueError("Cannot specify both --index and --all flags.")
 
-# run explainer on selected graph
-explanation = explainer(
-    data.x,
-    data.edge_index,
-    batch=batch,
-)
+    indices = None if args.all else (args.index or [0])
+    if (not indices or len(indices) > 1) and not args.evaluate and not args.save_explanation and not args.m_png:
+        print("Not enough parameters specified. Running this wouldn't do anything. Add parameters or speciufy a singular index to print result immediately.")
+        print("Aborting...")
+        return
 
-# todo save this somehow
-# print full explanation object
-print()
-print("Explanation:")
-print(explanation)
+    output_dir = Path(args.output_dir) / args.algorithm
 
-print()
-print("Node mask shape:")
-print(explanation.node_mask.shape)
-
-print()
-print("Edge mask shape:")
-print(explanation.edge_mask.shape)
-
-# shows edge importance as table
-print()
-print("Edge mask:")
-print(explanation.edge_mask)
-
-print()
-print("Top important atoms for this prediction:")
-node_importance = explanation.node_mask.abs().mean(dim=-1)
-for rank, idx in enumerate(torch.argsort(node_importance, descending=True)[: min(5, node_importance.numel())].tolist(), start=1):
-    atom_index = int(data.x[idx].argmax(dim=-1).item())
-    atom_name = atom_symbol_from_index(atom_index)
-    score = node_importance[idx].item()
-    print(f"  #{rank}: Node {idx} ({atom_name}) -> importance {score:.4f}")
-
-print()
-print("Top important bonds for this prediction:")
-edge_importance = explanation.edge_mask
-for rank, idx in enumerate(torch.argsort(edge_importance, descending=True)[: min(5, edge_importance.numel())].tolist(), start=1):
-    src, dst = data.edge_index[:, idx].tolist()
-    src_atom = atom_symbol_from_index(data.x[src].argmax(dim=-1).item())
-    dst_atom = atom_symbol_from_index(data.x[dst].argmax(dim=-1).item())
-    score = edge_importance[idx].item()
-    print(f"  #{rank}: {src_atom}-{dst_atom} (edge {idx}) -> importance {score:.4f}")
-
-print()
-print("Interpretation of classes:")
-for cls_id, meaning in CLASS_MEANINGS.items():
-    print(f"  Class {cls_id}: {meaning}")
-
-print()
-print("Meaning of this graph:")
-print(
-    f"  The selected molecule is classified as {CLASS_MEANINGS.get(predicted_class, 'unknown')} "
-    f"because the model assigned the highest score to class {predicted_class}."
-)
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import networkx as nx
-
-    g = nx.Graph()
-    node_importance = explanation.node_mask.abs().mean(dim=-1)
-    atom_indices = data.x.argmax(dim=-1).tolist()
-
-    for node_idx, atom_idx in enumerate(atom_indices):
-        atom_name = atom_symbol_from_index(atom_idx)
-        importance = float(node_importance[node_idx].item())
-        g.add_node(node_idx, atom=atom_name, importance=importance)
-
-    for edge_idx in range(data.edge_index.size(1)):
-        src, dst = data.edge_index[:, edge_idx].tolist()
-        importance = float(explanation.edge_mask[edge_idx].item())
-        g.add_edge(int(src), int(dst), weight=importance)
-
-    pos = nx.spring_layout(g, seed=42)
-    node_colors = [float(g.nodes[n]["importance"]) for n in g.nodes()]
-    edge_widths = [max(1.0, float(g.edges[e]["weight"]) * 6.0) for e in g.edges()]
-    edge_colors = [float(g.edges[e]["weight"]) for e in g.edges()]
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    nx.draw_networkx_edges(
-        g,
-        pos,
-        width=edge_widths,
-        edge_color=edge_colors,
-        edge_cmap=plt.cm.viridis,
-        alpha=0.9,
-        ax=ax,
-    )
-    nx.draw_networkx_nodes(
-        g,
-        pos,
-        node_color=node_colors,
-        node_size=[500 + 300 * max(0.0, v) for v in node_colors],
-        cmap=plt.cm.viridis,
-        edgecolors="black",
-        linewidths=1.0,
-        ax=ax,
-    )
-    nx.draw_networkx_labels(
-        g,
-        pos,
-        labels={n: g.nodes[n]["atom"] for n in g.nodes()},
-        font_size=12,
-        ax=ax,
+    results = run_explanations(
+        indices=indices,
+        algorithm=args.algorithm,
+        explanation_type=args.mode,
     )
 
-    importance_norm = plt.Normalize(vmin=0.0, vmax=1.0)
-    sm_importance = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=importance_norm)
-    sm_importance.set_array([])
+    if args.evaluate:
+        # ONLY_CORRECT: Whether to only investigate graphs the full model predicted correctly.
+        # This can make sense for evaluating model-based explanations.
+        if args.mode == "phenomenon":
+            ONLY_CORRECT = False
+        else:
+            ONLY_CORRECT = True
+        filename = "fidelity_" + args.mode
+        if args.evaluate == "basic":
+            evaluation = evaluate_fidelity(results, ONLY_CORRECT)
+            evaluation_file = save_fidelity_data(evaluation, output_dir, filename+".json")
+            print(f"Saved fidelity evaluation to: {evaluation_file}")
 
-    cbar = fig.colorbar(sm_importance, ax=ax, fraction=0.045, pad=0.1)
-    #cbar.set_label('Importance', rotation=270, labelpad=18)
-    cbar.ax.set_title('Importance', pad=8)
+        elif args.evaluate == "topk":
+            HARD = True # sets top-k explanation values to 1
+            evaluation = evaluate_fidelity_topk(results, args.topk_step, only_correct=ONLY_CORRECT, hard=HARD)
+            evaluation_file = save_fidelity_data(
+                evaluation,
+                output_dir,
+                f"{filename}_topk_{args.topk_step}.json",
+            )
+            print(f"Saved top-k fidelity evaluation to: {evaluation_file}")
+        else: 
+            raise ValueError("Unknown --evaluate value")
 
-    ax.set_title(
-        f"MUTAG graph explanation\n"
-        f"Predicted class: {predicted_class} ({CLASS_MEANINGS.get(predicted_class, 'unknown')})"
-    )
-    output_folder = {
-        0: "nonmutagenic",
-        1: "mutagenic",
-    }.get(int(data.y.item()), "unknown")
-    output_path = Path("output") / output_folder
-    output_path.mkdir(parents=True, exist_ok=True)
-    visualization_path = output_path / f"mutag_explanation_graph_{index}.png"
+    if args.save_explanation:
+        output_file = save_explanation_data(
+            results,
+            top_nodes=args.top_nodes,
+            top_edges=args.top_edges,
+            output_root=output_dir,
+        )
+        print(f"Saved {len(results)} explanation objects to: {output_file}")
 
-    plt.tight_layout()
-    plt.savefig(visualization_path, bbox_inches='tight', dpi=200)
-    print()
-    print(f"Saved visualization to: {visualization_path}")
-except Exception as exc:
-    print()
-    print("Visualization skipped because plotting dependencies are unavailable or failed:", exc)
+    if len(results) == 1:
+        print_result(results[0])
+
+    if args.m_png:
+        for result_number, result in enumerate(results, start=1):
+            try:
+                output_file = save_visualization(result, output_root=output_dir)
+                print(f"[{result_number}/{len(results)}] Saved visualization to: {output_file}")
+            except Exception as exc:
+                print(f"[{result_number}/{len(results)}] Visualization skipped: {exc}")
+
+
+if __name__ == "__main__":
+    main()

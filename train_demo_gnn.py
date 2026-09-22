@@ -1,3 +1,10 @@
+"""
+Script used to train a simple GIN model for running pyg evaluations on
+Note that the aim was to simply generate a demo GNN checkpoint fit for evalution purposes
+without keeping model quality in mind. 
+Model was saved to gin_mutag.pt
+"""
+
 import torch
 import torch.nn.functional as F
 
